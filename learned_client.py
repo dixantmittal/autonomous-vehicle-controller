@@ -10,10 +10,7 @@ from carla.client import make_carla_client
 from carla.sensor import Camera
 from carla.settings import CarlaSettings
 from carla.tcp import TCPConnectionError
-
-
-def getControls(image):
-    return None, None
+from imitation_learning_velocity_steer import *
 
 
 def run_carla_client(host, port, autopilot_on, save_images_to_disk, image_filename_format, settings_filepath):
@@ -73,7 +70,7 @@ def run_carla_client(host, port, autopilot_on, save_images_to_disk, image_filena
 
                 # get control instructions from model
                 with image as sensor_data['CameraRGB']:
-                    steer, throttle = getControls(image)
+                    steer, throttle = predictControls(image)
 
                 print(steer, throttle)
 
