@@ -16,11 +16,12 @@ simple_control_net = 'simple_control_net'
 
 networks = {
     recurrent_control_net: RecurrentControlNet('model/recurrentcontrolnet_rgb_steering_throttle.pt'),
-    control_net: ControlNet('model/controlnet_rgb_steering_throttle.pt'),
-    simple_control_net: SimpleControlNet('model/simplecontrolnet_rgb_steering_throttle.pt')
+    control_net: ControlNet('model/controlnet_rgb_steering_throttle.pt')
 }
 
 hidden_state = None
+previous_frames = []
+previous_controls = []
 
 optimizer = None
 loss_fn = torch.nn.MSELoss().cuda()
@@ -118,6 +119,7 @@ def train(network, batch_start, batch_end):
         distributed_model = model
 
     print('#' * 5, 'Starting Training', '#' * 5)
+    distributed_model.train()
 
     for epoch in range(args.epochs):
         print('\n==> Starting epoch: ', epoch + 1)
@@ -138,8 +140,7 @@ def train(network, batch_start, batch_end):
             # start training
             dataloader = DataLoader(dataset=CustomDataSet(X, y[:, 0]),
                                     batch_size=args.batch_size,
-                                    num_workers=10,
-                                    shuffle=True)
+                                    num_workers=10)
             hidden = None
             loss_history = []
             for itr, batch in tqdm(enumerate(dataloader)):
@@ -169,21 +170,47 @@ def train(network, batch_start, batch_end):
 def inference(network, X):
     global hidden_state
     model = networks[network]
+    model.eval()
 
     X = Variable(torch.from_numpy(X), requires_grad=False).type(torch.FloatTensor).cuda()
 
     controls, hidden_state = model(X, hidden_state)
+    if hidden_state is not None:
+        hidden_state = Variable(hidden_state.data)
     return controls
 
 
+def modify_if_sequential(X, y, network):
+    if network == recurrent_control_net:
+        if len(previous_frames) >= 10:
+            previous_frames.pop(0)
+            previous_controls.pop(0)
+
+        previous_frames.append(X)
+        previous_controls.append(y)
+
+        b, h, w, c = X.shape
+        X = np.array(previous_frames).reshape(-1, h, w, c)
+        y = np.array(previous_controls)
+
+    return X, y
+
+
 def simultaneous_inference_and_learning(network, X, y):
+    global hidden_state
+
+    X, y = modify_if_sequential(X, y, network)
+
     # loaded network
     model = networks[network]
 
     X = Variable(torch.from_numpy(X), requires_grad=False).type(torch.FloatTensor).cuda()
     y = Variable(torch.from_numpy(np.array([y])), requires_grad=False).type(torch.FloatTensor).cuda()
 
-    prediction, _ = model(X, None)
+    prediction, hidden_state = model(X, hidden_state)
+    if hidden_state is not None:
+        hidden_state = Variable(hidden_state.data)
+        prediction = prediction.squeeze()
 
     # improve current policy
     optimizer.zero_grad()
@@ -194,8 +221,6 @@ def simultaneous_inference_and_learning(network, X, y):
         print('Disagreement in network and autopilot mode.')
         print('Network says: %.5f' % prediction[0].data[0], ', Autopilot says: %.5f' % y[0].data[0])
         return prediction
-
-    print('Difference in prediction: %.5f' % loss.data[0] ** 0.5)
 
     # calculate the loss
     loss.backward()
@@ -238,21 +263,21 @@ def save(network):
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
-    argparser.add_argument('--network', default='control_net',
+    argparser.add_argument('--network', default=control_net,
                            help='architecture to use (default: control_net)')
     argparser.add_argument('--epochs', default=5, type=int, metavar='N',
                            help='number of total epochs to run')
     argparser.add_argument('--batch-size', default=128, type=int, metavar='N', dest='batch_size',
-                           help='mini-batch size (default: 256)')
+                           help='mini-batch size (default: 128)')
     argparser.add_argument('--learning-rate', default=0.0003, type=float, metavar='LR', dest='lr',
                            help='initial learning rate')
     argparser.add_argument('--start-set', type=int, default=0, dest='start_set',
                            help='starting image set to load (default: 0)')
-    argparser.add_argument('--end-set', type=int, default=299, dest='end_set',
+    argparser.add_argument('--end-set', type=int, default=15, dest='end_set',
                            help='ending image set to load (default: 299)')
-    argparser.add_argument('--set-dir', default='data/data_rgb', dest='dir',
+    argparser.add_argument('--set-dir', default='data/numpy/real_256_128', dest='dir',
                            help='directory for image set to load (default: data_rgb)')
-    argparser.add_argument('--load-sets', default=5, type=int, dest='n_sets',
+    argparser.add_argument('--load-sets', default=3, type=int, dest='n_sets',
                            help='number of image sets to load (default: data_rgb)')
     argparser.add_argument('--multi-gpu', dest='multi_gpu', action='store_true',
                            help='Use multiple gpus')
@@ -263,5 +288,8 @@ if __name__ == '__main__':
     lr = args.lr
 
     init(args.network)
-
-    train(args.network, args.start_set, args.end_set + 1)
+    try:
+        train(args.network, args.start_set, args.end_set + 1)
+    except KeyboardInterrupt:
+        save(args.network)
+        print('\nCancelled by user. Bye!')

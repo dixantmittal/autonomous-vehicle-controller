@@ -46,6 +46,8 @@ def run(host, port, online_training):
             client.start_episode(np.random.randint(number_of_player_starts - 1))
 
             # Iterate every frame in the episode.
+            frame = 0
+            count_diff = 0
             for frame in range(frames_per_episode):
                 # Read the data produced by the server in this frame.
                 measurements, sensor_data = client.read_data()
@@ -65,19 +67,20 @@ def run(host, port, online_training):
                     # disconnect the episode if there's a disagreement between network and autopilot
                     if (predicted_controls[0].data[
                             0] - measurements.player_measurements.autopilot_control.steer) ** 2 > 0.5:
-                        break
+                        if count_diff < 10:
+                            count_diff += 1
+                        else:
+                            break
 
                 else:
                     predicted_controls = network_wrapper.inference(args.network, image)
-                    #                 image, _ = network_wrapper.flip_data(X=image)
-                    #                 _, predicted_controls = network_wrapper.unnormalize_data(y=predicted_controls)
-                    #                 _, predicted_controls = network_wrapper.flip_data(y=predicted_controls)
-                    #                 steer, throttle = predicted_controls[0], predicted_controls[1]
 
                 steer = predicted_controls[0].data[0]
                 throttle = measurements.player_measurements.autopilot_control.throttle
                 if measurements.player_measurements.forward_speed > 20:
                     throttle = min(0.5, throttle)
+
+                print('Squared error: %.7f' % (steer - measurements.player_measurements.autopilot_control.steer) ** 2)
 
                 # send control to simulator
                 client.send_control(
@@ -86,7 +89,8 @@ def run(host, port, online_training):
                     brake=0.0,
                     hand_brake=False,
                     reverse=False)
-            network_wrapper.save(args.network)
+            if frame == frames_per_episode - 1:
+                network_wrapper.save(args.network)
 
 
 if __name__ == '__main__':
@@ -128,9 +132,7 @@ if __name__ == '__main__':
             run(host=args.host, port=args.port, online_training=args.online_training)
             break
         except TCPConnectionError as error:
-            network_wrapper.save(args.network)
             print(error)
         except KeyboardInterrupt:
-            network_wrapper.save(args.network)
             print('\nCancelled by user. Bye!')
             break
