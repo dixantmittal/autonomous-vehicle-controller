@@ -6,21 +6,32 @@ from torchvision.models import resnet
 
 class ControlNet(Module):
 
-    def __init__(self, model_path, image_dims=(3, 128, 256)):
+    def __init__(self, model_path):
         super(ControlNet, self).__init__()
-        c, h, w = image_dims
-        resnet18_conv = list(resnet.resnet18(pretrained=True).children())[:-2]
-        self.resnet_base = nn.Sequential(*resnet18_conv)
+
+        resnet_base = list(resnet.resnet18(pretrained=True).children())[:-2]
+        self.resnet_base = nn.Sequential(*resnet_base)
+
+        # reduce resnet features to a vector of 2048 dimension (for this image size)
         self.reduce = nn.Conv2d(in_channels=512, out_channels=64, kernel_size=1)
-        self.controls = nn.Linear(64 * h * w // 1024, 1)
+
+        self.bn_reduce = nn.BatchNorm2d(num_features=64)
+
+        # output controls directly from this vector
+        self.controls = nn.Linear(2048, 1)
+
         self.model_path = model_path
 
     def forward(self, inputs, hidden=None):
         inputs = inputs.permute(0, 3, 1, 2)
         n_batch, n_channel, n_height, n_width = inputs.size()
+
         features = F.dropout(F.leaky_relu(self.resnet_base(inputs)), 0.5)
-        reduce = F.dropout(F.leaky_relu(self.reduce(features)), 0.5)
-        flatten = reduce.view(n_batch, -1)
+
+        reduce = self.reduce(features)
+        bn_reduce = F.dropout(F.leaky_relu(self.bn_reduce(reduce)), 0.5)
+
+        flatten = bn_reduce.view(n_batch, -1)
         controls = self.controls(flatten)
 
         return controls, None
@@ -28,33 +39,43 @@ class ControlNet(Module):
 
 class RecurrentControlNet(Module):
 
-    def __init__(self, model_path, hidden_size=2048, image_dims=(3, 128, 256)):
+    def __init__(self, model_path, hidden_size=2048):
         super(RecurrentControlNet, self).__init__()
-        c, h, w = image_dims
+
+        # extract input image features
         resnet18_conv = list(resnet.resnet18(pretrained=True).children())[:-2]
         self.resnet_base = nn.Sequential(*resnet18_conv)
+
+        # reduce the features to a vector of 2048 dims
         self.reduce = nn.Conv2d(in_channels=512, out_channels=64, kernel_size=1)
-        self.gru = nn.GRU(64 * h * w // 1024, hidden_size, 1, dropout=0.5)
+
+        # batch normalization for reduced form
+        self.bn_reduce = nn.BatchNorm2d(num_features=64)
+
+        self.features = nn.Linear(2048, hidden_size)
+
+        self.bn_features = nn.BatchNorm1d(num_features=2048)
+
+        # pass this 2048 vector to GRU along with hidden vector of dims 2048
+        self.gru = nn.GRU(hidden_size, hidden_size, 1)
+
+        # batch normalization for encoded output
+        self.bn_gru = nn.BatchNorm1d(num_features=2048)
+
+        # output the controls directly from GRU's output
         self.controls = nn.Linear(hidden_size, 1)
+
         self.model_path = model_path
 
-    """
-        Inputs: input, h_0
-            - **input** (seq_len, batch, input_size): tensor containing the features
-              of the input sequence. The input can also be a packed variable length
-              sequence. See :func:`torch.nn.utils.rnn.pack_padded_sequence`
-              for details.
-            - **h_0** (num_layers * num_directions, batch, hidden_size): tensor
-              containing the initial hidden state for each element in the batch.
-
-        Outputs: output, h_n
-            - **output** (seq_len, batch, hidden_size * num_directions): tensor
-              containing the output features h_t from the last layer of the RNN,
-              for each t. If a :class:`torch.nn.utils.rnn.PackedSequence` has been
-              given as the input, the output will also be a packed sequence.
-            - **h_n** (num_layers * num_directions, batch, hidden_size): tensor
-              containing the hidden state for t=seq_len
-    """
+    #
+    # Inputs: input, h_0
+    #       - **input** (batch, input_size): tensor containing input images. Batch is deemed to be sequential and is
+    #                                            internally split into a sequential length of 10.
+    #       - **h_0** (batch, hidden_size): tensor containing the initial hidden state for each element in the batch.
+    #
+    # Outputs: output, h_n
+    #       - **output** (batch, 1): tensor containing the output steering control.
+    #       - **h_n** (batch, hidden_size): tensor containing the hidden state for t=seq_len
 
     def forward(self, inputs, hidden_state=None):
         inputs = inputs.permute(0, 3, 1, 2)
@@ -63,8 +84,17 @@ class RecurrentControlNet(Module):
         n_batch = n_batch // n_seq
 
         resnet = F.dropout(F.leaky_relu(self.resnet_base(inputs)), 0.5)
-        reduce = F.dropout(F.leaky_relu(self.reduce(resnet)), 0.5)
-        flatten = reduce.view(n_seq, n_batch, -1)
-        gru_out, hidden_state = self.gru(flatten, hidden_state)
-        controls = self.controls(F.leaky_relu(gru_out.view(n_batch * n_seq, -1))).view(n_seq, n_batch, -1)
+
+        reduce = self.reduce(resnet)
+        bn_reduce = F.dropout(F.leaky_relu(self.bn_reduce(reduce)), 0.5)
+
+        flatten = bn_reduce.view(n_seq * n_batch, -1)
+
+        features = F.dropout(F.leaky_relu(self.bn_features(self.features(flatten))), 0.5)
+
+        gru_out, hidden_state = self.gru(features, hidden_state)
+        bn_gru = F.dropout(F.leaky_relu(self.bn_gru(gru_out.view(n_batch * n_seq, -1))), 0.5)
+
+        controls = self.controls(bn_gru).view(n_seq, n_batch, -1)
+
         return controls, hidden_state

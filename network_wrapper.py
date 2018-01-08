@@ -6,17 +6,15 @@ import torch
 from torch.autograd import Variable
 from torch.backends import cudnn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.model_zoo import tqdm
 
 from architectures import *
 
 recurrent_control_net = 'recurrent_control_net'
 control_net = 'control_net'
-simple_control_net = 'simple_control_net'
 
 networks = {
-    recurrent_control_net: RecurrentControlNet('model/recurrentcontrolnet_rgb_steering_throttle.pt'),
-    control_net: ControlNet('model/controlnet_rgb_steering_throttle.pt')
+    recurrent_control_net: RecurrentControlNet('model/recurrentcontrolnet.pt'),
+    control_net: ControlNet('model/controlnet.pt')
 }
 
 hidden_state = None
@@ -27,12 +25,12 @@ optimizer = None
 loss_fn = torch.nn.MSELoss().cuda()
 cudnn.benchmark = True
 
-lr = 3e-4
+lr = 3e-6
 
 
 class CustomDataSet(Dataset):
     def __init__(self, X, y):
-        X, _ = normalize_data(X)
+        # X, _ = normalize_data(X)
         self.X = torch.from_numpy(X)
         self.y = torch.from_numpy(y)
         pass
@@ -52,6 +50,8 @@ def get_data(start, end):
     y = None
     for b in range(start, end):
 
+        # if b % 3 == 0:
+        #     continue
         # train for data batches
         try:
             if X is None:
@@ -69,6 +69,7 @@ def get_data(start, end):
     if X is not None:
         print('Input Data Shape: ', X.shape)
         print('Input Controls Shape: ', y.shape)
+        print()
 
     return X, y
 
@@ -111,19 +112,19 @@ def flip_data(X=None, y=None):
 
 
 def train(network, batch_start, batch_end):
-    model = networks[network]
+    model = networks[network].cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     if args.multi_gpu:
-        print('====> Multiple GPUs mode: [ON]')
+        print('>> Multiple GPUs mode: [ON] <<')
         distributed_model = torch.nn.DataParallel(model)
     else:
         distributed_model = model
 
-    print('#' * 5, 'Starting Training', '#' * 5)
+    print('#' * 10, 'Starting Training', '#' * 10, '\n')
     distributed_model.train()
 
+    loss_history = []
     for epoch in range(args.epochs):
-        print('\n==> Starting epoch: ', epoch + 1)
-
         start = batch_start
         while start < batch_end:
             if batch_end - start > args.n_sets:
@@ -141,16 +142,12 @@ def train(network, batch_start, batch_end):
             dataloader = DataLoader(dataset=CustomDataSet(X, y[:, 0]),
                                     batch_size=args.batch_size,
                                     num_workers=10)
-            hidden = None
-            loss_history = []
-            for itr, batch in tqdm(enumerate(dataloader)):
+
+            for itr, batch in enumerate(dataloader):
                 X = Variable(batch[0], requires_grad=False).type(torch.FloatTensor).cuda()
                 y = Variable(batch[1], requires_grad=False).type(torch.FloatTensor).cuda()
 
-                prediction, hidden = distributed_model(X, hidden)
-                if hidden is not None:
-                    hidden = Variable(hidden.data)
-
+                prediction, _ = distributed_model(X, None)
                 optimizer.zero_grad()
                 loss = loss_fn(prediction, y)
 
@@ -158,26 +155,25 @@ def train(network, batch_start, batch_end):
 
                 optimizer.step()
                 loss_history.append(loss.data[0])
+                print("Itr/Epoch: %2d/%2d loss: %.6f" % (itr, epoch, loss))
 
-            print()
-            print('==> loss: ', np.mean(loss_history))
-            print()
             save(network)
-    print()
-    print('#' * 5, 'Training Finished', '#' * 5)
+            np.save('loss_history.npy', np.array(loss_history))
+    print('\n', '#' * 10, 'Training Finished', '#' * 10)
 
 
 def inference(network, X):
     global hidden_state
-    model = networks[network]
+    model = networks[network].cuda()
     model.eval()
 
     X = Variable(torch.from_numpy(X), requires_grad=False).type(torch.FloatTensor).cuda()
 
-    controls, hidden_state = model(X, hidden_state)
+    prediction, hidden_state = model(X, hidden_state)
     if hidden_state is not None:
         hidden_state = Variable(hidden_state.data)
-    return controls
+        prediction = prediction.squeeze()
+    return prediction[-1]
 
 
 def modify_if_sequential(X, y, network):
@@ -196,20 +192,19 @@ def modify_if_sequential(X, y, network):
     return X, y
 
 
-def simultaneous_inference_and_learning(network, X, y):
-    global hidden_state
-
+def online_training(network, X, y):
     X, y = modify_if_sequential(X, y, network)
 
     # loaded network
-    model = networks[network]
+    model = networks[network].cuda()
+    model.eval()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     X = Variable(torch.from_numpy(X), requires_grad=False).type(torch.FloatTensor).cuda()
     y = Variable(torch.from_numpy(np.array([y])), requires_grad=False).type(torch.FloatTensor).cuda()
 
-    prediction, hidden_state = model(X, hidden_state)
-    if hidden_state is not None:
-        hidden_state = Variable(hidden_state.data)
+    prediction, _ = model(X, None)
+    if network == recurrent_control_net:
         prediction = prediction.squeeze()
 
     # improve current policy
@@ -217,12 +212,10 @@ def simultaneous_inference_and_learning(network, X, y):
 
     loss = loss_fn(prediction, y)
 
-    if loss.data[0] > 0.5:
-        print('Disagreement in network and autopilot mode.')
-        print('Network says: %.5f' % prediction[0].data[0], ', Autopilot says: %.5f' % y[0].data[0])
+    if loss.data[0] > 35:
         return prediction
 
-    # calculate the loss
+    # backprop the loss
     loss.backward()
 
     # optimize it
@@ -234,31 +227,93 @@ def simultaneous_inference_and_learning(network, X, y):
 
 def init(network):
     global optimizer
+    global previous_controls
+    global previous_frames
+    previous_controls, previous_frames = [], []
     model = networks[network]
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     try:
-        print('====> Model Path: ', model.model_path)
+        print()
+        print('>> Loading Model... <<')
+        print('> Model Path: ', model.model_path)
         model_state = torch.load(model.model_path)
         model.load_state_dict(model_state['state_dict'])
         optimizer.load_state_dict(model_state['optimizer'])
-        print('====> Model found and loaded!!')
+        print('> Model found and loaded!!')
     except (OSError, _pickle.UnpicklingError):
-        print('====> Model not found. Training from scratch...')
-
-    networks[network] = model.cuda()
+        print('> Model not found. Training from scratch.')
+    print()
 
 
 def save(network):
     model = networks[network]
-    print('====> Saving Model <==== ')
-    print('====> Model Path: ', model.model_path)
+    print()
+    print('>> Saving Model... << ')
+    print('> Model Path: ', model.model_path)
     torch.save({
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
     }, model.model_path)
-    print('====> Model Saved Successfully!!')
+    print('> Model Saved Successfully!!')
+    print()
+
+
+def sanity_check(network):
+    global optimizer
+    model = networks[network].cuda()
+    model.train()
+    X, y = get_data(0, 1)
+    # start training
+    dataloader = DataLoader(dataset=CustomDataSet(X[:100], y[:100, 0]),
+                            batch_size=10,
+                            num_workers=10)
+
+    print('#' * 10, 'Overfitting Small Data', '#' * 10, '\n')
+    for epoch in range(args.epochs):
+        hidden = None
+        for itr, batch in enumerate(dataloader):
+            X = Variable(batch[0], requires_grad=False).type(torch.FloatTensor).cuda()
+            y = Variable(batch[1], requires_grad=False).type(torch.FloatTensor).cuda()
+
+            prediction, hidden = model(X, hidden)
+            if hidden is not None:
+                hidden = Variable(hidden.data)
+
+            optimizer.zero_grad()
+            loss = loss_fn(prediction, y)
+
+            loss.backward()
+
+            optimizer.step()
+            print("Epoch: %2d loss: %.6f" % (epoch, loss))
+
+    print('\n', '#' * 10, 'Overfitting Done', '#' * 10)
+
+    print('#' * 10, 'Finding Learning Rate', '#' * 10, '\n')
+
+    for i in range(20):
+        init(network)
+        model = networks[network].cuda()
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=10 ** np.random.uniform(-4, -1))
+        for epoch in range(args.epochs // 10):
+            hidden = None
+            for itr, batch in enumerate(dataloader):
+                X = Variable(batch[0], requires_grad=False).type(torch.FloatTensor).cuda()
+                y = Variable(batch[1], requires_grad=False).type(torch.FloatTensor).cuda()
+
+                prediction, hidden = model(X, hidden)
+                if hidden is not None:
+                    hidden = Variable(hidden.data)
+                optimizer.zero_grad()
+                loss = loss_fn(prediction, y)
+                loss.backward()
+                optimizer.step()
+                print("Epoch: %2d loss: %.6f lr: %f" % (epoch, loss, lr))
+
+    print('\n', '#' * 10, 'Done', '#' * 10)
 
 
 if __name__ == '__main__':
@@ -282,6 +337,9 @@ if __name__ == '__main__':
     argparser.add_argument('--multi-gpu', dest='multi_gpu', action='store_true',
                            help='Use multiple gpus')
     argparser.set_defaults(multi_gpu=False)
+    argparser.add_argument('--sanity-check', dest='sanity_check', action='store_true',
+                           help='Sanity check')
+    argparser.set_defaults(sanity_check=False)
 
     args = argparser.parse_args()
 
@@ -289,7 +347,9 @@ if __name__ == '__main__':
 
     init(args.network)
     try:
-        train(args.network, args.start_set, args.end_set + 1)
+        if args.sanity_check:
+            sanity_check(args.network)
+        else:
+            train(args.network, args.start_set, args.end_set + 1)
     except KeyboardInterrupt:
-        save(args.network)
         print('\nCancelled by user. Bye!')

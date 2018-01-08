@@ -15,7 +15,7 @@ def run(host, port, online_training):
     n_episodes = args.episodes
     frames_per_episode = args.frames
     image_dims = (256, 128)
-    network_wrapper.init(args.network)
+    loss_history = []
 
     with make_carla_client(host, port) as client:
         print('CarlaClient connected')
@@ -23,11 +23,11 @@ def run(host, port, online_training):
         # Start a new episode.
         settings = CarlaSettings()
         settings.set(
-            SynchronousMode=False,
+            SynchronousMode=online_training,
             SendNonPlayerAgentsInfo=True,
             NumberOfVehicles=25,
             NumberOfPedestrians=25,
-            WeatherId=np.random.choice(14))
+            WeatherId=np.random.choice(1))
         settings.randomize_seeds()
 
         # add 1st camera
@@ -42,8 +42,9 @@ def run(host, port, online_training):
         number_of_player_starts = len(scene.player_start_spots)
 
         for episode in range(n_episodes):
+            network_wrapper.init(args.network)
             print('Starting new episode:', episode)
-            client.start_episode(np.random.randint(number_of_player_starts - 1))
+            client.start_episode(episode % number_of_player_starts)
 
             # Iterate every frame in the episode.
             frame = 0
@@ -55,41 +56,47 @@ def run(host, port, online_training):
                 # get the image and convert to numpy array
                 image = sensor_data['CameraRGB']
                 image = np.expand_dims(np.array(image.data), axis=0)
-                image, _ = network_wrapper.normalize_data(X=image)
+                # image, _ = network_wrapper.normalize_data(X=image)
 
                 if online_training:
 
                     # train and inference simultaneously
-                    predicted_controls = network_wrapper.simultaneous_inference_and_learning(args.network, image,
-                                                                                             measurements.player_measurements.autopilot_control.steer)
+                    predicted_controls = network_wrapper.online_training(args.network, image,
+                                                                         measurements.player_measurements.autopilot_control.steer * 70)
 
                     # because the autopilot follows a planned path,
                     # disconnect the episode if there's a disagreement between network and autopilot
-                    if (predicted_controls[0].data[
-                            0] - measurements.player_measurements.autopilot_control.steer) ** 2 > 0.5:
+                    if abs(predicted_controls.data[
+                               0] - measurements.player_measurements.autopilot_control.steer * 70) > 35:
+                        print('Disagreement in network and autopilot mode.')
+                        print('Network says: %.5f' % predicted_controls.data[0],
+                              ', Autopilot says: %.5f' % (
+                                      measurements.player_measurements.autopilot_control.steer * 70))
                         if count_diff < 10:
                             count_diff += 1
                         else:
                             break
+                    else:
+                        count_diff = 0
 
                 else:
                     predicted_controls = network_wrapper.inference(args.network, image)
 
-                steer = predicted_controls[0].data[0]
-                throttle = measurements.player_measurements.autopilot_control.throttle
-                if measurements.player_measurements.forward_speed > 20:
-                    throttle = min(0.5, throttle)
+                steer = predicted_controls.data[0]
 
-                print('Squared error: %.7f' % (steer - measurements.player_measurements.autopilot_control.steer) ** 2)
+                loss = abs(steer - measurements.player_measurements.autopilot_control.steer)
+                loss_history.append(loss)
+                print('Loss: %.5f' % loss)
 
                 # send control to simulator
                 client.send_control(
-                    steer=steer,
-                    throttle=throttle,
+                    steer=steer / 70,
+                    throttle=0.5,
                     brake=0.0,
                     hand_brake=False,
                     reverse=False)
-            if frame == frames_per_episode - 1:
+                np.save('loss_history_online_training.npy', np.array(loss_history))
+            if online_training and count_diff < 10:
                 network_wrapper.save(args.network)
 
 
